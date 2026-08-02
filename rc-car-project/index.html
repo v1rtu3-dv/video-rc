@@ -6,17 +6,15 @@
     <title>RC Car FPV Teleoperation</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121212; color: #fff; text-align: center; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; display: none; } /* Hidden until authenticated */
+        .container { max-width: 800px; margin: 0 auto; display: none; }
         .feed-card { background: #1e1e1e; border-radius: 12px; padding: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
         .feed-card img { width: 100%; height: auto; border-radius: 8px; display: block; background: #000; }
         .controls { display: grid; grid-template-columns: repeat(3, 70px); gap: 10px; justify-content: center; margin: 20px 0; }
         .btn { width: 70px; height: 70px; font-size: 22px; font-weight: bold; background: #2a2a2a; color: white; border: 2px solid #444; border-radius: 8px; cursor: pointer; user-select: none; }
         .btn:active, .btn.active { background: #007aff; border-color: #0056b3; }
-        .mic-btn { width: 230px; height: 50px; font-size: 16px; font-weight: bold; background: #e74c3c; color: white; border: none; border-radius: 25px; cursor: pointer; transition: 0.2s; }
-        .mic-btn.recording { background: #2ecc71; transform: scale(1.03); }
+        .audio-btn { padding: 12px 24px; font-size: 16px; font-weight: bold; background: #27ae60; color: white; border: none; border-radius: 6px; cursor: pointer; margin-bottom: 15px; }
+        .audio-btn.active { background: #c0392b; }
         .status { font-size: 14px; color: #aaa; margin-top: 10px; }
-        
-        /* Auth Modal Overlay */
         #auth-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #121212; display: flex; align-items: center; justify-content: center; z-index: 1000; }
         .auth-card { background: #1e1e1e; padding: 30px; border-radius: 12px; border: 1px solid #333; width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); }
         .auth-card h2 { margin-top: 0; color: #fff; }
@@ -30,7 +28,6 @@
 </head>
 <body>
 
-    <!-- Auth Login Overlay -->
     <div id="auth-overlay">
         <div class="auth-card">
             <h2>RC FPV Login</h2>
@@ -41,7 +38,6 @@
         </div>
     </div>
 
-    <!-- Main Teleoperation Dashboard -->
     <div class="container" id="app-container">
         <div class="user-header">
             <span id="user-email-display" class="status">Logged in</span>
@@ -50,24 +46,20 @@
 
         <h1>RC Car Teleoperation</h1>
 
-        <!-- FPV Video Feed (Src populated dynamically upon login) -->
+        <button id="enable-audio-btn" class="audio-btn">Enable Live Audio Stream</button>
+
         <div class="feed-card">
             <img id="video-feed" alt="Live FPV Video Feed">
         </div>
 
         <p class="status" id="ws-status">Connecting to car...</p>
 
-        <!-- Motor Grid Controls -->
         <div class="controls">
             <div></div><button class="btn" id="btn-w">W</button><div></div>
             <button class="btn" id="btn-a">A</button><button class="btn" id="btn-s">S</button><button class="btn" id="btn-d">D</button>
         </div>
-
-        <!-- Push to Talk Button -->
-        <button id="mic-btn" class="mic-btn">Hold to Speak to Car</button>
     </div>
 
-    <!-- Firebase v10 Modular SDKs & App Logic -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
@@ -85,53 +77,78 @@
         const auth = getAuth(app);
 
         let ws = null;
-        let mediaRecorder = null;
+        let audioCtx = null;
+        let micStream = null;
+        let scriptProcessor = null;
+        let nextAudioTime = 0;
+        let audioEnabled = false;
         const activeKeys = new Set();
 
-        // UI References
         const authOverlay = document.getElementById('auth-overlay');
         const appContainer = document.getElementById('app-container');
         const emailInput = document.getElementById('email-input');
         const passwordInput = document.getElementById('password-input');
         const loginBtn = document.getElementById('login-btn');
         const logoutBtn = document.getElementById('logout-btn');
+        const audioBtn = document.getElementById('enable-audio-btn');
         const authError = document.getElementById('auth-error');
         const userEmailDisplay = document.getElementById('user-email-display');
         const videoFeed = document.getElementById('video-feed');
         const statusText = document.getElementById('ws-status');
-        const micBtn = document.getElementById('mic-btn');
 
-        // Handle Login Click
         loginBtn.addEventListener('click', async () => {
             authError.innerText = '';
-            const email = emailInput.value.trim();
-            const password = passwordInput.value;
-            
             try {
-                await signInWithEmailAndPassword(auth, email, password);
+                await signInWithEmailAndPassword(auth, emailInput.value.trim(), passwordInput.value);
             } catch (error) {
                 authError.innerText = "Invalid credentials.";
             }
         });
 
-        // Handle Logout
         logoutBtn.addEventListener('click', () => {
+            stopMic();
             signOut(auth);
         });
 
-        // Auth State Observer
+        audioBtn.addEventListener('click', async () => {
+            try {
+                if (!audioCtx) {
+                    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                    if (!AudioContextClass) {
+                        alert("Web Audio API is not supported in this browser.");
+                        return;
+                    }
+                    audioCtx = new AudioContextClass({ sampleRate: 16000 });
+                }
+                
+                if (audioCtx.state === 'suspended') {
+                    await audioCtx.resume();
+                }
+
+                if (!audioEnabled) {
+                    await startMicPCM();
+                    audioEnabled = true;
+                    audioBtn.innerText = "Disable Live Audio Stream";
+                    audioBtn.classList.add('active');
+                } else {
+                    stopMic();
+                    audioEnabled = false;
+                    audioBtn.innerText = "Enable Live Audio Stream";
+                    audioBtn.classList.remove('active');
+                }
+            } catch (err) {
+                console.error("Audio initialization error:", err);
+                alert("Audio Error: " + err.message);
+            }
+        });
+
         onAuthStateChanged(auth, (user) => {
             if (user) {
-                // User is signed in
                 authOverlay.style.display = 'none';
                 appContainer.style.display = 'block';
                 userEmailDisplay.innerText = `User: ${user.email}`;
-                
-                // Start Video Stream & WebSocket
-                videoFeed.src = "/video_feed";
                 initWebSocket();
             } else {
-                // User is signed out
                 authOverlay.style.display = 'flex';
                 appContainer.style.display = 'none';
                 videoFeed.src = "";
@@ -139,18 +156,104 @@
             }
         });
 
-        // WebSocket Connection
         function initWebSocket() {
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+            ws.binaryType = "arraybuffer";
 
-            ws.onopen = () => { statusText.innerText = 'Connected to Car'; statusText.style.color = '#2ecc71'; };
-            ws.onclose = () => { statusText.innerText = 'Disconnected'; statusText.style.color = '#e74c3c'; };
+            ws.onopen = () => { 
+                statusText.innerText = 'Connected (30 FPS Paced Stream)'; 
+                statusText.style.color = '#2ecc71';
+            };
+
+            ws.onmessage = (event) => {
+                if (typeof event.data === "string") {
+                    // Safe JSON parsing for structured video frames
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === "video") {
+                        videoFeed.src = "data:image/jpeg;base64," + msg.data;
+                    }
+                } else if (event.data instanceof ArrayBuffer) {
+                    // Dedicated binary blocks for audio only
+                    playPcmAudio(event.data);
+                }
+            };
+
+            ws.onclose = () => { 
+                statusText.innerText = 'Disconnected'; 
+                statusText.style.color = '#e74c3c'; 
+                stopMic();
+            };
         }
 
-        // 1. WASD Motor Telemetry
+        function playPcmAudio(arrayBuffer) {
+            if (!audioCtx || !audioEnabled) return;
+
+            const pcm16 = new Int16Array(arrayBuffer);
+            if (pcm16.length === 0) return;
+
+            const float32 = new Float32Array(pcm16.length);
+            for (let i = 0; i < pcm16.length; i++) {
+                float32[i] = pcm16[i] / 32768.0;
+            }
+
+            const buffer = audioCtx.createBuffer(1, float32.length, 16000);
+            buffer.getChannelData(0).set(float32);
+
+            const source = audioCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioCtx.destination);
+
+            const now = audioCtx.currentTime;
+            if (nextAudioTime < now) nextAudioTime = now + 0.005;
+            source.start(nextAudioTime);
+            nextAudioTime += buffer.duration;
+        }
+
+        async function startMicPCM() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert("Microphone access requires HTTPS or localhost.");
+                return;
+            }
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        sampleRate: 16000, 
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                });
+
+                const micSource = audioCtx.createMediaStreamSource(micStream);
+                scriptProcessor = audioCtx.createScriptProcessor(256, 1, 1);
+
+                scriptProcessor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN && audioEnabled) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const pcm16 = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                        }
+                        ws.send(pcm16.buffer);
+                    }
+                };
+
+                micSource.connect(scriptProcessor);
+                scriptProcessor.connect(audioCtx.destination);
+            } catch (err) {
+                console.error("Mic error:", err);
+                alert("Could not access microphone: " + err.message);
+            }
+        }
+
+        function stopMic() {
+            if (scriptProcessor) scriptProcessor.disconnect();
+            if (micStream) micStream.getTracks().forEach(t => t.stop());
+        }
+
         window.addEventListener('keydown', (e) => {
-            if (auth.currentUser === null) return;
+            if (auth.currentUser === null || !e.key) return;
             const key = e.key.toLowerCase();
             if (['w', 'a', 's', 'd'].includes(key) && !activeKeys.has(key)) {
                 activeKeys.add(key);
@@ -160,7 +263,7 @@
         });
 
         window.addEventListener('keyup', (e) => {
-            if (auth.currentUser === null) return;
+            if (auth.currentUser === null || !e.key) return;
             const key = e.key.toLowerCase();
             if (['w', 'a', 's', 'd'].includes(key)) {
                 activeKeys.delete(key);
@@ -173,42 +276,6 @@
             if (ws && ws.readyState === WebSocket.OPEN) {
                 const command = Array.from(activeKeys).join('') || 'stop';
                 ws.send(JSON.stringify({ type: 'drive', command: command }));
-            }
-        }
-
-        // 2. Push-to-Talk Mic Capture
-        micBtn.addEventListener('mousedown', startMic);
-        micBtn.addEventListener('mouseup', stopMic);
-        micBtn.addEventListener('mouseleave', stopMic);
-
-        async function startMic() {
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                alert("Microphone access requires HTTPS or localhost!");
-                return;
-            }
-
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-                
-                mediaRecorder.ondataavailable = (e) => {
-                    if (e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(e.data);
-                    }
-                };
-                mediaRecorder.start(100);
-                micBtn.innerText = "Transmitting Voice...";
-                micBtn.classList.add('recording');
-            } catch (err) {
-                console.error("Microphone access denied:", err);
-            }
-        }
-
-        function stopMic() {
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                mediaRecorder.stop();
-                micBtn.innerText = "Hold to Speak to Car";
-                micBtn.classList.remove('recording');
             }
         }
     </script>
