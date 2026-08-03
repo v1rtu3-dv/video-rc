@@ -1,0 +1,9 @@
+tunnel: a7b3ee72-ae19-4873-9659-5a009e102bb7
+credentials-file: /Users/aaronbrant/.cloudflared/a7b3ee72-ae19-4873-9659-5a009e102bb7.json
+protocol: http2
+
+ingress:
+  - hostname: rc.v1rtu3.dev
+    service: http://127.0.0.1:8000
+
+  - service: http_status:444
