@@ -247,11 +247,12 @@ class MotorDriver:
         elif VERBOSE:
             print(f"[motor sim] left={self.left:+.2f} right={self.right:+.2f}")
         return self.telemetry()
-
-    def drive(self, throttle: float, turn: float) -> Dict[str, Any]:
-        left = clamp(throttle + turn)
-        right = clamp(throttle - turn)
-        return self.set_tank(left, right)
+       
+        def drive(self, throttle: float, turn: float) -> Dict[str, Any]:
+            # Direct mapping: throttle controls Drive Motor (Pin 17/18), turn controls Steering Motor (Pin 22/23)
+            drive_motor = clamp(throttle)
+            steering_motor = clamp(turn)
+            return self.set_tank(drive_motor, steering_motor)
 
     def stop(self) -> None:
         self.set_tank(0.0, 0.0)
