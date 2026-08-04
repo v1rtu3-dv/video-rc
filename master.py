@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import asyncio
@@ -210,8 +208,8 @@ class MotorDriver:
         self.left = 0.0
         self.right = 0.0
         self._gpio: Any = None
-        self._left_motor: Any = None
-        self._right_motor: Any = None
+        self._drive_motor: Any = None
+        self._steer_motor: Any = None
         self._init_gpio()
 
     def _init_gpio(self) -> None:
@@ -224,33 +222,31 @@ class MotorDriver:
         try:
             from gpiozero import Motor  # type: ignore
 
-            left_pins = (int(os.environ.get("RC_LEFT_FWD", "17")), int(os.environ.get("RC_LEFT_REV", "18")))
-            right_pins = (int(os.environ.get("RC_RIGHT_FWD", "22")), int(os.environ.get("RC_RIGHT_REV", "23")))
-            self._left_motor = Motor(forward=left_pins[0], backward=left_pins[1], pwm=True)
-            self._right_motor = Motor(forward=right_pins[0], backward=right_pins[1], pwm=True)
+            drive_pins = (int(os.environ.get("RC_DRIVE_FWD", "17")), int(os.environ.get("RC_DRIVE_REV", "18")))
+            steer_pins = (int(os.environ.get("RC_STEER_FWD", "22")), int(os.environ.get("RC_STEER_REV", "23")))
+            self._drive_motor = Motor(forward=drive_pins[0], backward=drive_pins[1], pwm=True)
+            self._steer_motor = Motor(forward=steer_pins[0], backward=steer_pins[1], pwm=True)
             self.mode = "gpiozero"
-            print(f"Motor driver using gpiozero. Left={left_pins}, Right={right_pins}")
+            print(f"Motor driver using gpiozero. Drive={drive_pins}, Steer={steer_pins}")
         except Exception as exc:
             print(f"GPIO unavailable ({exc}); motor driver using simulator mode.")
 
-    def set_tank(self, left: float, right: float) -> Dict[str, Any]:
-        self.left = clamp(left)
-        self.right = clamp(right)
+    def set_tank(self, throttle: float, turn: float) -> Dict[str, Any]:
+        self.left = clamp(throttle)
+        self.right = clamp(turn)
         if self.mode == "gpiozero":
-            self._apply_gpio(self._left_motor, self.left)
-            self._apply_gpio(self._right_motor, self.right)
+            self._apply_gpio(self._drive_motor, self.left)
+            self._apply_gpio(self._steer_motor, self.right)
         elif VERBOSE:
-            print(f"[motor sim] left={self.left:+.2f} right={self.right:+.2f}")
+            print(f"[motor sim] throttle={self.left:+.2f} turn={self.right:+.2f}")
         return self.telemetry()
 
     def drive(self, throttle: float, turn: float) -> Dict[str, Any]:
-        drive_motor = clamp(throttle)
-        steering_motor = clamp(turn)
-        return self.set_tank(drive_motor, steering_motor)
+        return self.set_tank(throttle, turn)
 
     def stop(self) -> None:
         self.set_tank(0.0, 0.0)
-        for motor in (self._left_motor, self._right_motor):
+        for motor in (self._drive_motor, self._steer_motor):
             if motor is not None:
                 with suppress(Exception):
                     motor.stop()
@@ -798,8 +794,8 @@ HTML = r"""<!doctype html>
       </section>
 
       <section class="panel locked" id="drivePanel">
-        <div class="row"><span>Left PWM</span><span class="value" id="leftPwm">0.00</span></div>
-        <div class="row"><span>Right PWM</span><span class="value" id="rightPwm">0.00</span></div>
+        <div class="row"><span>Drive PWM</span><span class="value" id="leftPwm">0.00</span></div>
+        <div class="row"><span>Steer PWM</span><span class="value" id="rightPwm">0.00</span></div>
         <div class="row"><span>Input</span><span class="value" id="inputState">neutral</span></div>
         <div class="controls">
           <div class="key spacer"></div><div class="key" data-key="w">W</div><div class="key spacer"></div>
