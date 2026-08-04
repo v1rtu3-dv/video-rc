@@ -1,13 +1,4 @@
-#!/usr/bin/env python3
-"""
-Standalone cross-platform RC teleoperation server.
 
-Run:
-    python3 master.py
-
-Optional dependencies for full hardware support:
-    pip install fastapi uvicorn opencv-python numpy sounddevice gpiozero
-"""
 
 from __future__ import annotations
 
@@ -23,8 +14,9 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
 try:
@@ -62,6 +54,9 @@ AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "512"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
 VOICE_RMS_THRESHOLD = float(os.environ.get("RC_VOICE_RMS", "0.018"))
 VOICE_HOLD_SECONDS = float(os.environ.get("RC_VOICE_HOLD", "0.38"))
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "AIzaSyBX2ybnshzC8rdm2M7RIrU77jva1KqfR3Y")
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "levislawns")
+_AUTH_CACHE: Dict[str, tuple[float, str]] = {}
 
 
 class CancelledErrorFilter(logging.Filter):
@@ -247,12 +242,11 @@ class MotorDriver:
         elif VERBOSE:
             print(f"[motor sim] left={self.left:+.2f} right={self.right:+.2f}")
         return self.telemetry()
-       
-        def drive(self, throttle: float, turn: float) -> Dict[str, Any]:
-            # Direct mapping: throttle controls Drive Motor (Pin 17/18), turn controls Steering Motor (Pin 22/23)
-            drive_motor = clamp(throttle)
-            steering_motor = clamp(turn)
-            return self.set_tank(drive_motor, steering_motor)
+
+    def drive(self, throttle: float, turn: float) -> Dict[str, Any]:
+        drive_motor = clamp(throttle)
+        steering_motor = clamp(turn)
+        return self.set_tank(drive_motor, steering_motor)
 
     def stop(self) -> None:
         self.set_tank(0.0, 0.0)
@@ -476,6 +470,42 @@ def pcm16_rms(data: bytes) -> float:
     return math.sqrt(total / count)
 
 
+def verify_firebase_token_sync(token: str) -> Optional[str]:
+    if not token:
+        return None
+    cached = _AUTH_CACHE.get(token)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:lookup?key={FIREBASE_API_KEY}"
+    body = json.dumps({"idToken": token}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        if VERBOSE:
+            print(f"firebase auth failed: {exc}")
+        return None
+    users = payload.get("users") or []
+    if not users:
+        return None
+    user = users[0]
+    uid = user.get("localId")
+    if not uid:
+        return None
+    _AUTH_CACHE[token] = (time.monotonic() + 120, uid)
+    return uid
+
+
+async def websocket_firebase_uid(ws: WebSocket) -> Optional[str]:
+    token = ws.query_params.get("token", "")
+    uid = await asyncio.to_thread(verify_firebase_token_sync, token)
+    if not uid:
+        await ws.close(code=1008, reason="login required")
+        return None
+    return uid
+
+
 camera = ThreadedCamera(VIDEO_DEVICE, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, JPEG_QUALITY)
 motors = MotorDriver()
 audio = AudioManager(AUDIO_RATE, AUDIO_BLOCK)
@@ -658,6 +688,26 @@ HTML = r"""<!doctype html>
     }
     button.on { border-color: var(--good); background: #0e3326; }
     button.warn { border-color: var(--warn); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .locked {
+      opacity: .45;
+      pointer-events: none;
+    }
+    input {
+      min-height: 38px;
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #090c10;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    .authGrid {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
     .buttonGrid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -728,16 +778,26 @@ HTML = r"""<!doctype html>
       </header>
 
       <section class="panel">
+        <div class="row"><span>Login</span><span class="value" id="authStatus">signed out</span></div>
+        <div class="authGrid" id="loginPanel">
+          <input id="emailInput" type="email" autocomplete="email" placeholder="Email">
+          <input id="passwordInput" type="password" autocomplete="current-password" placeholder="Password">
+          <button id="loginBtn">Sign In</button>
+        </div>
+        <button id="logoutBtn" style="display:none;margin-top:10px;width:100%;">Sign Out</button>
+      </section>
+
+      <section class="panel">
         <div class="buttonGrid">
-          <button id="micBtn">Enable Mic</button>
-          <button id="listenBtn">Listen Host</button>
+          <button id="micBtn" disabled>Enable Mic</button>
+          <button id="listenBtn" disabled>Listen Host</button>
         </div>
         <div class="row"><span>Client mic</span><span class="meter"><i id="micMeter"></i></span></div>
         <div class="row"><span>Host mic</span><span class="meter"><i id="hostMeter"></i></span></div>
         <div class="row"><span>Audio</span><span class="value" id="audioStatus">idle</span></div>
       </section>
 
-      <section class="panel">
+      <section class="panel locked" id="drivePanel">
         <div class="row"><span>Left PWM</span><span class="value" id="leftPwm">0.00</span></div>
         <div class="row"><span>Right PWM</span><span class="value" id="rightPwm">0.00</span></div>
         <div class="row"><span>Input</span><span class="value" id="inputState">neutral</span></div>
@@ -750,7 +810,20 @@ HTML = r"""<!doctype html>
     </aside>
   </main>
 
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyBX2ybnshzC8rdm2M7RIrU77jva1KqfR3Y",
+      authDomain: "levislawns.firebaseapp.com",
+      projectId: "levislawns",
+      storageBucket: "levislawns.firebasestorage.app",
+      messagingSenderId: "514611346211",
+      appId: "1:514611346211:web:61b1d48bae07b1f528aa96"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+
     const AUDIO_RATE = 48000;
     const VOICE_RMS_THRESHOLD = 0.018;
     const VOICE_HOLD_MS = 380;
@@ -768,9 +841,17 @@ HTML = r"""<!doctype html>
       audioStatus: document.getElementById("audioStatus"),
       micMeter: document.getElementById("micMeter"),
       hostMeter: document.getElementById("hostMeter"),
+      authStatus: document.getElementById("authStatus"),
+      loginPanel: document.getElementById("loginPanel"),
+      emailInput: document.getElementById("emailInput"),
+      passwordInput: document.getElementById("passwordInput"),
+      loginBtn: document.getElementById("loginBtn"),
+      logoutBtn: document.getElementById("logoutBtn"),
+      drivePanel: document.getElementById("drivePanel"),
       joy: document.getElementById("joy"),
       stick: document.getElementById("stick")
     };
+    let currentUser = null;
     let controlWs, micWs, hostWs, audioCtx, micStream, micNode, micSource;
     let joyVec = {x: 0, y: 0};
     let playTime = 0;
@@ -782,6 +863,12 @@ HTML = r"""<!doctype html>
       return `${proto}//${location.host}${path}`;
     }
 
+    async function authedWsUrl(path) {
+      if (!currentUser) throw new Error("Please sign in first.");
+      const token = await currentUser.getIdToken();
+      return `${wsUrl(path)}?token=${encodeURIComponent(token)}`;
+    }
+
     function displayPlatform(name) {
       if (name === "Darwin") return "macOS";
       if (name === "Linux") return "Linux";
@@ -789,8 +876,10 @@ HTML = r"""<!doctype html>
       return name || "unknown";
     }
 
-    function connectControl() {
-      controlWs = new WebSocket(wsUrl("/ws/control"));
+    async function connectControl() {
+      if (!currentUser) return;
+      if (controlWs && (controlWs.readyState === WebSocket.OPEN || controlWs.readyState === WebSocket.CONNECTING)) return;
+      controlWs = new WebSocket(await authedWsUrl("/ws/control"));
       controlWs.onopen = () => {
         els.controlDot.classList.add("ok");
         els.controlStatus.textContent = "control online";
@@ -798,8 +887,8 @@ HTML = r"""<!doctype html>
       };
       controlWs.onclose = () => {
         els.controlDot.classList.remove("ok");
-        els.controlStatus.textContent = "control offline";
-        setTimeout(connectControl, 700);
+        els.controlStatus.textContent = currentUser ? "control offline" : "login required";
+        if (currentUser) setTimeout(() => connectControl().catch(() => {}), 700);
       };
       controlWs.onmessage = (event) => {
         const msg = JSON.parse(event.data);
@@ -818,6 +907,7 @@ HTML = r"""<!doctype html>
     }
 
     function commandVector() {
+      if (!currentUser) return {x: 0, y: 0};
       let x = joyVec.x;
       let y = joyVec.y;
       if (keys.has("w")) y += 1;
@@ -833,7 +923,7 @@ HTML = r"""<!doctype html>
       const v = commandVector();
       els.inputState.textContent = `${v.y.toFixed(2)}, ${v.x.toFixed(2)}`;
       document.querySelectorAll(".key[data-key]").forEach(k => k.classList.toggle("active", keys.has(k.dataset.key)));
-      if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+      if (currentUser && controlWs && controlWs.readyState === WebSocket.OPEN) {
         controlWs.send(JSON.stringify({x: v.x, y: v.y, keys: Array.from(keys), ts: Date.now()}));
       }
     }
@@ -841,6 +931,7 @@ HTML = r"""<!doctype html>
     setInterval(sendControl, 45);
 
     addEventListener("keydown", (e) => {
+      if (!currentUser) return;
       const k = keyMap[e.key];
       if (!k) return;
       e.preventDefault();
@@ -871,7 +962,12 @@ HTML = r"""<!doctype html>
         els.stick.style.transform = `translate(${dx}px, ${dy}px)`;
         sendControl();
       };
-      els.joy.addEventListener("pointerdown", e => { active = true; els.joy.setPointerCapture(e.pointerId); update(e.clientX, e.clientY); });
+      els.joy.addEventListener("pointerdown", e => {
+        if (!currentUser) return;
+        active = true;
+        els.joy.setPointerCapture(e.pointerId);
+        update(e.clientX, e.clientY);
+      });
       els.joy.addEventListener("pointermove", e => { if (active) update(e.clientX, e.clientY); });
       const end = e => {
         active = false;
@@ -937,6 +1033,7 @@ HTML = r"""<!doctype html>
     }
 
     async function toggleMic() {
+      if (!currentUser) throw new Error("Please sign in first.");
       if (micWs) {
         micWs.close();
         micWs = null;
@@ -957,7 +1054,7 @@ HTML = r"""<!doctype html>
         },
         video: false
       });
-      micWs = new WebSocket(wsUrl("/ws/audio_in"));
+      micWs = new WebSocket(await authedWsUrl("/ws/audio_in"));
       micWs.binaryType = "arraybuffer";
       await new Promise(resolve => micWs.onopen = resolve);
       micSource = ctx.createMediaStreamSource(micStream);
@@ -1025,6 +1122,7 @@ HTML = r"""<!doctype html>
     }
 
     async function toggleListen() {
+      if (!currentUser) throw new Error("Please sign in first.");
       if (hostWs) {
         hostWs.close();
         hostWs = null;
@@ -1033,7 +1131,7 @@ HTML = r"""<!doctype html>
         return;
       }
       ensureAudioContext();
-      hostWs = new WebSocket(wsUrl("/ws/audio_out"));
+      hostWs = new WebSocket(await authedWsUrl("/ws/audio_out"));
       hostWs.binaryType = "arraybuffer";
       hostWs.onmessage = event => playPCM16(event.data);
       hostWs.onopen = () => {
@@ -1050,8 +1148,31 @@ HTML = r"""<!doctype html>
 
     els.micBtn.addEventListener("click", () => toggleMic().catch(err => showAudioError(err, "Microphone could not be started.")));
     els.listenBtn.addEventListener("click", () => toggleListen().catch(err => showAudioError(err, "Host audio could not be started.")));
+    els.loginBtn.addEventListener("click", () => {
+      auth.signInWithEmailAndPassword(els.emailInput.value.trim(), els.passwordInput.value)
+        .catch(err => showAudioError(err, "Login failed."));
+    });
+    els.logoutBtn.addEventListener("click", () => auth.signOut());
+    auth.onAuthStateChanged(user => {
+      currentUser = user;
+      els.authStatus.textContent = user ? (user.email || "signed in") : "signed out";
+      els.loginPanel.style.display = user ? "none" : "grid";
+      els.logoutBtn.style.display = user ? "block" : "none";
+      els.micBtn.disabled = !user;
+      els.listenBtn.disabled = !user;
+      els.drivePanel.classList.toggle("locked", !user);
+      if (user) {
+        connectControl().catch(err => showAudioError(err, "Control connection failed."));
+      } else {
+        keys.clear();
+        if (controlWs) controlWs.close();
+        if (micWs) micWs.close();
+        if (hostWs) hostWs.close();
+        els.controlStatus.textContent = "login required";
+        els.controlDot.classList.remove("ok");
+      }
+    });
     setupJoystick();
-    connectControl();
   </script>
 </body>
 </html>
@@ -1099,6 +1220,9 @@ async def video_feed() -> StreamingResponse:
 @app.websocket("/ws/control")
 async def ws_control(ws: WebSocket) -> None:
     await ws.accept()
+    uid = await websocket_firebase_uid(ws)
+    if not uid:
+        return
     await ws.send_json({"telemetry": motors.telemetry(), "audio": audio.status()})
     last_msg = time.monotonic()
     watchdog_task = asyncio.create_task(control_watchdog(ws, lambda: last_msg))
@@ -1137,6 +1261,9 @@ async def control_watchdog(ws: WebSocket, last_msg_getter: Any) -> None:
 @app.websocket("/ws/audio_in")
 async def ws_audio_in(ws: WebSocket) -> None:
     await ws.accept()
+    uid = await websocket_firebase_uid(ws)
+    if not uid:
+        return
     try:
         while True:
             data = await ws.receive_bytes()
@@ -1150,6 +1277,9 @@ async def ws_audio_in(ws: WebSocket) -> None:
 @app.websocket("/ws/audio_out")
 async def ws_audio_out(ws: WebSocket) -> None:
     await ws.accept()
+    uid = await websocket_firebase_uid(ws)
+    if not uid:
+        return
     listener = audio.add_host_listener()
     try:
         while True:
