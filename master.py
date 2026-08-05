@@ -928,6 +928,7 @@ HTML = r"""<!doctype html>
 
     addEventListener("keydown", (e) => {
       if (!currentUser) return;
+      if (document.activeElement && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA")) return;
       const k = keyMap[e.key];
       if (!k) return;
       e.preventDefault();
@@ -935,6 +936,7 @@ HTML = r"""<!doctype html>
       sendControl();
     }, {passive: false});
     addEventListener("keyup", (e) => {
+      if (document.activeElement && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA")) return;
       const k = keyMap[e.key];
       if (!k) return;
       e.preventDefault();
