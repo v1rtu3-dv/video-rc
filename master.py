@@ -293,6 +293,7 @@ class AudioManager:
         self._lock = threading.Lock()
         self._last_input_rms = 0.0
         self._last_output_rms = 0.0
+        self._input_device_index: Optional[int] = None
         self._device_summary = "sounddevice unavailable"
         if self.available:
             self._probe_devices()
@@ -300,8 +301,25 @@ class AudioManager:
     def _probe_devices(self) -> None:
         try:
             devices = sd.query_devices()
+            usb_mic_idx = None
+            fallback_mic_idx = None
+
+            for i, dev in enumerate(devices):
+                if dev.get("max_input_channels", 0) > 0:
+                    name = dev.get("name", "").lower()
+                    if "webcam" in name or "camera" in name:
+                        continue
+                    if "usb" in name or "wireless" in name:
+                        usb_mic_idx = i
+                        break
+                    if fallback_mic_idx is None:
+                        fallback_mic_idx = i
+
+            self._input_device_index = usb_mic_idx if usb_mic_idx is not None else fallback_mic_idx
+
             default_in, default_out = sd.default.device
-            self._device_summary = f"default input={default_in}, output={default_out}, devices={len(devices)}"
+            selected_in = self._input_device_index if self._input_device_index is not None else default_in
+            self._device_summary = f"input={selected_in}, output={default_out}, devices={len(devices)}"
             print(f"Audio devices: {self._device_summary}")
         except Exception as exc:
             self.available = False
@@ -378,6 +396,7 @@ class AudioManager:
 
         try:
             self._input_stream = sd.RawInputStream(
+                device=self._input_device_index,
                 samplerate=self.sample_rate,
                 channels=1,
                 dtype="int16",
