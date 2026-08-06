@@ -202,26 +202,15 @@ class ThreadedCamera:
 
 
 class MotorDriver:
-
-    def stop(self) -> None:
-        """Zeros motor speed without destroying the GPIO pins."""
+    def __init__(self) -> None:
+        self.platform = platform.system()
+        self.mode = "simulator"
         self.left = 0.0
         self.right = 0.0
-        if self.mode == "gpiozero":
-            if self._drive_motor:
-                with suppress(Exception):
-                    self._drive_motor.stop()
-            if self._steer_motor:
-                with suppress(Exception):
-                    self._steer_motor.stop()
-
-    def cleanup(self) -> None:
-        """Destroys GPIO pin objects on server shutdown only."""
-        self.stop()
-        for motor in (self._drive_motor, self._steer_motor):
-            if motor is not None:
-                with suppress(Exception):
-                    motor.close()
+        self._gpio: Any = None
+        self._drive_motor: Any = None
+        self._steer_motor: Any = None
+        self._init_gpio()
 
     def _init_gpio(self) -> None:
         is_linux = self.platform == "Linux"
@@ -267,7 +256,7 @@ class MotorDriver:
     def telemetry(self) -> Dict[str, Any]:
         return {
             "ts": now_ms(),
-            self.platform = "RPi"
+            "platform": self.platform,
             "mode": self.mode,
             "left": round(self.left, 3),
             "right": round(self.right, 3),
