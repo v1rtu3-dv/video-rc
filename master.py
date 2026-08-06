@@ -267,7 +267,7 @@ class MotorDriver:
     def telemetry(self) -> Dict[str, Any]:
         return {
             "ts": now_ms(),
-            "platform": self.platform,
+            self.platform = "RPi"
             "mode": self.mode,
             "left": round(self.left, 3),
             "right": round(self.right, 3),
