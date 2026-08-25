@@ -1212,8 +1212,10 @@ async def mjpeg_generator():
                 + frame
                 + b"\r\n"
             )
+            # Yield control immediately to flush socket output and prevent backpressure
+            await asyncio.sleep(0)
             await asyncio.sleep(delay)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
         return
 
 
@@ -1222,7 +1224,11 @@ async def video_feed() -> StreamingResponse:
     return StreamingResponse(
         mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Connection": "close",
+        },
     )
 
 
@@ -1260,8 +1266,9 @@ async def ws_control(ws: WebSocket) -> None:
 async def control_watchdog(ws: WebSocket, last_msg_getter: Any) -> None:
     try:
         while True:
-            await asyncio.sleep(0.2)
-            if time.monotonic() - last_msg_getter() > 0.35:
+            await asyncio.sleep(0.1)
+            # Increased timeout to 0.65s so Wi-Fi jitter won't kill motors
+            if time.monotonic() - last_msg_getter() > 0.65:
                 motors.stop()
     except asyncio.CancelledError:
         return
