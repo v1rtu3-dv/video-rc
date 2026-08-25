@@ -43,10 +43,10 @@ except Exception as exc:
 HOST = os.environ.get("RC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RC_PORT", "8000"))
 VIDEO_DEVICE = int(os.environ.get("RC_VIDEO_DEVICE", "1"))
-VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "640"))
-VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "480"))
+VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "480"))
+VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "360"))
 VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
-JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "70"))
+JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "50"))
 AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
 AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "512"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
@@ -74,7 +74,7 @@ def quiet_stream_disconnect_logs() -> None:
 TINY_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
     "2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/"
-    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/"
+    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/"
     "9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Ap//xAAUEAEAAAAAAAAA"
     "AAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EABQRAQAAAAAAAAAAAAAAAAAAABD/"
     "2gAIAQIBAT8QH//EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z"
@@ -171,6 +171,9 @@ class ThreadedCamera:
             start = time.monotonic()
             jpeg: Optional[bytes] = None
             if self._camera_ok and self._cap:
+                # Flush extra OpenCV frame buffer
+                for _ in range(2):
+                    self._cap.grab()
                 ok, frame = self._cap.read()
                 if ok and frame is not None and cv2 is not None:
                     ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
@@ -287,7 +290,7 @@ class AudioManager:
         self.input_ok = False
         self._output_stream: Any = None
         self._input_stream: Any = None
-        self._speaker_q: queue.Queue[bytes] = queue.Queue(maxsize=16)
+        self._speaker_q: queue.Queue[bytes] = queue.Queue(maxsize=8)
         self._speaker_buffer = bytearray()
         self._client_speaking_until = 0.0
         self._host_speaking_until = 0.0
@@ -404,7 +407,9 @@ class AudioManager:
             if now < self._host_speaking_until:
                 return
             self._client_speaking_until = now + VOICE_HOLD_SECONDS
-        while self._speaker_q.full():
+        
+        # Non-blocking clear of stale audio packets to eliminate buffer delay
+        while self._speaker_q.qsize() > 2:
             with suppress(queue.Empty):
                 self._speaker_q.get_nowait()
         with suppress(queue.Full):
@@ -927,15 +932,7 @@ HTML = r"""<!doctype html>
       }
     }
 
-    setInterval(sendControl, 45);
-
-    setInterval(() => {
-      const img = document.querySelector('.video');
-      if (img) {
-        const src = img.src.split('?')[0];
-        img.src = `${src}?t=${Date.now()}`;
-      }
-    }, 600000);
+    setInterval(sendControl, 60);
 
     addEventListener("keydown", (e) => {
       if (!currentUser) return;
@@ -1201,19 +1198,20 @@ async def status() -> Dict[str, Any]:
 async def mjpeg_generator():
     boundary = b"--frame"
     delay = 1.0 / max(VIDEO_FPS, 1)
+    last_frame = None
     try:
         while True:
             frame = camera.frame()
-            yield (
-                boundary
-                + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store, no-cache, must-revalidate\r\nContent-Length: "
-                + str(len(frame)).encode()
-                + b"\r\n\r\n"
-                + frame
-                + b"\r\n"
-            )
-            # Yield control immediately to flush socket output and prevent backpressure
-            await asyncio.sleep(0)
+            if frame is not last_frame:
+                last_frame = frame
+                yield (
+                    boundary
+                    + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store, no-cache, must-revalidate\r\nContent-Length: "
+                    + str(len(frame)).encode()
+                    + b"\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
             await asyncio.sleep(delay)
     except (asyncio.CancelledError, Exception):
         return
@@ -1267,7 +1265,6 @@ async def control_watchdog(ws: WebSocket, last_msg_getter: Any) -> None:
     try:
         while True:
             await asyncio.sleep(0.1)
-            # Increased timeout to 0.65s so Wi-Fi jitter won't kill motors
             if time.monotonic() - last_msg_getter() > 0.65:
                 motors.stop()
     except asyncio.CancelledError:
