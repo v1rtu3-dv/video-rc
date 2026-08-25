@@ -45,7 +45,7 @@ PORT = int(os.environ.get("RC_PORT", "8000"))
 VIDEO_DEVICE = int(os.environ.get("RC_VIDEO_DEVICE", "1"))
 VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "640"))
 VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "480"))
-VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "60"))
+VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
 JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "70"))
 AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
 AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "512"))
@@ -108,8 +108,6 @@ class ThreadedCamera:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        # On macOS, AVFoundation camera permission checks must happen on the
-        # main run loop. Opening before the worker starts avoids a noisy failure.
         self._open()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="camera", daemon=True)
@@ -250,6 +248,11 @@ class MotorDriver:
             if motor is not None:
                 with suppress(Exception):
                     motor.stop()
+
+    def close(self) -> None:
+        self.stop()
+        for motor in (self._drive_motor, self._steer_motor):
+            if motor is not None:
                 with suppress(Exception):
                     motor.close()
 
@@ -516,7 +519,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         print("Shutting down hardware streams.")
-        motors.stop()
+        motors.close()
         audio.stop()
         camera.stop()
 
@@ -861,7 +864,7 @@ HTML = r"""<!doctype html>
 
     async function authedWsUrl(path) {
       if (!currentUser) throw new Error("Please sign in first.");
-      const token = await currentUser.getIdToken();
+      const token = await currentUser.getIdToken(true);
       return `${wsUrl(path)}?token=${encodeURIComponent(token)}`;
     }
 
@@ -925,6 +928,14 @@ HTML = r"""<!doctype html>
     }
 
     setInterval(sendControl, 45);
+
+    setInterval(() => {
+      const img = document.querySelector('.video');
+      if (img) {
+        const src = img.src.split('?')[0];
+        img.src = `${src}?t=${Date.now()}`;
+      }
+    }, 600000);
 
     addEventListener("keydown", (e) => {
       if (!currentUser) return;
@@ -1195,7 +1206,7 @@ async def mjpeg_generator():
             frame = camera.frame()
             yield (
                 boundary
-                + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\nContent-Length: "
+                + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store, no-cache, must-revalidate\r\nContent-Length: "
                 + str(len(frame)).encode()
                 + b"\r\n\r\n"
                 + frame
