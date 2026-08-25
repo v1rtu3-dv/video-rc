@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 # Suppress low-level ALSA / C-library error spew on Linux systems
 if platform.system() == "Linux":
@@ -53,16 +53,16 @@ HOST = os.environ.get("RC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RC_PORT", "8000"))
 
 # Supports both integer indices (1) and explicit V4L2 device paths ("/dev/video1")
-_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "1")
+_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "auto")
 VIDEO_DEVICE: Any = int(_raw_dev) if _raw_dev.isdigit() else _raw_dev
 
-VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "480"))
-VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "360"))
+# Defaults tuned for crisp high-definition streaming
+VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "1280"))
+VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "720"))
 VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
-JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "50"))
+JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "85"))
 AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
 
-# Raised default audio block size to prevent ALSA buffer underruns
 AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "1024"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
 VOICE_RMS_THRESHOLD = float(os.environ.get("RC_VOICE_RMS", "0.018"))
@@ -104,6 +104,22 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def detect_available_cameras(max_probe: int = 8) -> List[Any]:
+    """Scans hardware indices to detect available cameras."""
+    if cv2 is None:
+        return []
+    found: List[Any] = []
+    backend = cv2.CAP_V4L2 if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
+    for idx in range(max_probe):
+        cap = cv2.VideoCapture(idx, backend)
+        if cap and cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                found.append(idx)
+            cap.release()
+    return found
+
+
 class ThreadedCamera:
     def __init__(self, device: Any, width: int, height: int, fps: float, quality: int) -> None:
         self.device = device
@@ -134,11 +150,27 @@ class ThreadedCamera:
             print("cv2 is not installed; using static fallback video frame.")
             return
 
-        # Prefer V4L2 API explicitly on Linux to avoid unnecessary driver probes
-        if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2"):
-            self._cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        else:
-            self._cap = cv2.VideoCapture(self.device)
+        target_device = self.device
+
+        # If device is set to "auto" or failed initialization, scan available devices
+        if target_device == "auto":
+            available = detect_available_cameras()
+            if available:
+                target_device = available[0]
+                print(f"Detected cameras at indices {available}. Auto-selected index {target_device}.")
+            else:
+                target_device = 0
+
+        backend = cv2.CAP_V4L2 if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
+        self._cap = cv2.VideoCapture(target_device, backend)
+
+        if not self._cap or not self._cap.isOpened():
+            # Attempt to probe alternative connected cameras if initial choice fails
+            available = detect_available_cameras()
+            if available and available[0] != target_device:
+                target_device = available[0]
+                print(f"Falling back to discovered camera index {target_device}.")
+                self._cap = cv2.VideoCapture(target_device, backend)
 
         if not self._cap or not self._cap.isOpened():
             self._camera_ok = False
@@ -146,15 +178,26 @@ class ThreadedCamera:
                 with suppress(Exception):
                     self._cap.release()
                 self._cap = None
-            print(f"No camera detected at index/device {self.device}; using generated dummy video.")
+            print(f"No usable camera detected at index/device {self.device}; using generated dummy video.")
             return
+
         self._camera_ok = True
+        self.device = target_device
+
+        # Configure High Quality Stream & MJPEG Codec hardware acceleration
+        with suppress(Exception):
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)
+        
+        # Crisp camera controls (sharpness/auto-exposure focus)
         with suppress(Exception):
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"Camera opened at device {self.device}.")
+
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Camera opened at device {self.device} ({actual_w}x{actual_h} @ {self.fps}FPS).")
 
     def _dummy_frame(self) -> Optional[bytes]:
         if cv2 is None or np is None:
@@ -192,11 +235,21 @@ class ThreadedCamera:
             start = time.monotonic()
             jpeg: Optional[bytes] = None
             if self._camera_ok and self._cap:
-                for _ in range(2):
-                    self._cap.grab()
                 ok, frame = self._cap.read()
                 if ok and frame is not None and cv2 is not None:
-                    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+                    # Optional crisp resizing if hardware captured a different size
+                    h, w = frame.shape[:2]
+                    if w != self.width or h != self.height:
+                        frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+                    
+                    ok, encoded = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [
+                            int(cv2.IMWRITE_JPEG_QUALITY), self.quality,
+                            int(cv2.IMWRITE_JPEG_OPTIMIZE), 1
+                        ],
+                    )
                     if ok:
                         jpeg = encoded.tobytes()
                 else:
@@ -423,7 +476,7 @@ class AudioManager:
             if now < self._host_speaking_until:
                 return
             self._client_speaking_until = now + VOICE_HOLD_SECONDS
-        
+
         while self._speaker_q.qsize() > 4:
             with suppress(queue.Empty):
                 self._speaker_q.get_nowait()
@@ -597,7 +650,8 @@ HTML = r"""<!doctype html>
       width: 100%;
       height: 100%;
       object-fit: contain;
-      image-rendering: auto;
+      image-rendering: -webkit-optimize-contrast;
+      image-rendering: crisp-edges;
     }
     .topbar {
       position: absolute;
@@ -787,7 +841,7 @@ HTML = r"""<!doctype html>
       <img class="video" src="/video_feed" alt="Live video">
       <div class="topbar">
         <div class="badge"><span id="controlDot" class="dot"></span><span id="controlStatus">control offline</span></div>
-        <div class="badge"><span id="fps">video stream</span></div>
+        <div class="badge"><span id="fps">HD stream</span></div>
       </div>
     </section>
     <aside>
