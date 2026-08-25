@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
 import json
 import logging
 import math
@@ -16,6 +17,14 @@ import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Dict, Optional, Set
+
+# Suppress low-level ALSA / C-library error spew on Linux systems
+if platform.system() == "Linux":
+    try:
+        asound = ctypes.cdll.LoadLibrary("libasound.so.2")
+        asound.snd_lib_error_set_handler(None)
+    except Exception:
+        pass
 
 try:
     import cv2  # type: ignore
@@ -42,13 +51,19 @@ except Exception as exc:
 
 HOST = os.environ.get("RC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RC_PORT", "8000"))
-VIDEO_DEVICE = int(os.environ.get("RC_VIDEO_DEVICE", "1"))
+
+# Supports both integer indices (1) and explicit V4L2 device paths ("/dev/video1")
+_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "1")
+VIDEO_DEVICE: Any = int(_raw_dev) if _raw_dev.isdigit() else _raw_dev
+
 VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "480"))
 VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "360"))
 VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
 JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "50"))
 AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
-AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "512"))
+
+# Raised default audio block size to prevent ALSA buffer underruns
+AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "1024"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
 VOICE_RMS_THRESHOLD = float(os.environ.get("RC_VOICE_RMS", "0.018"))
 VOICE_HOLD_SECONDS = float(os.environ.get("RC_VOICE_HOLD", "0.38"))
@@ -90,7 +105,7 @@ def now_ms() -> int:
 
 
 class ThreadedCamera:
-    def __init__(self, device: int, width: int, height: int, fps: float, quality: int) -> None:
+    def __init__(self, device: Any, width: int, height: int, fps: float, quality: int) -> None:
         self.device = device
         self.width = width
         self.height = height
@@ -118,14 +133,20 @@ class ThreadedCamera:
         if cv2 is None:
             print("cv2 is not installed; using static fallback video frame.")
             return
-        self._cap = cv2.VideoCapture(self.device)
+
+        # Prefer V4L2 API explicitly on Linux to avoid unnecessary driver probes
+        if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2"):
+            self._cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        else:
+            self._cap = cv2.VideoCapture(self.device)
+
         if not self._cap or not self._cap.isOpened():
             self._camera_ok = False
             if self._cap:
                 with suppress(Exception):
                     self._cap.release()
                 self._cap = None
-            print(f"No camera detected at index {self.device}; using generated dummy video.")
+            print(f"No camera detected at index/device {self.device}; using generated dummy video.")
             return
         self._camera_ok = True
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -133,7 +154,7 @@ class ThreadedCamera:
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)
         with suppress(Exception):
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"Camera opened at index {self.device}.")
+        print(f"Camera opened at device {self.device}.")
 
     def _dummy_frame(self) -> Optional[bytes]:
         if cv2 is None or np is None:
@@ -171,7 +192,6 @@ class ThreadedCamera:
             start = time.monotonic()
             jpeg: Optional[bytes] = None
             if self._camera_ok and self._cap:
-                # Flush extra OpenCV frame buffer
                 for _ in range(2):
                     self._cap.grab()
                 ok, frame = self._cap.read()
@@ -290,7 +310,7 @@ class AudioManager:
         self.input_ok = False
         self._output_stream: Any = None
         self._input_stream: Any = None
-        self._speaker_q: queue.Queue[bytes] = queue.Queue(maxsize=8)
+        self._speaker_q: queue.Queue[bytes] = queue.Queue(maxsize=16)
         self._speaker_buffer = bytearray()
         self._client_speaking_until = 0.0
         self._host_speaking_until = 0.0
@@ -327,8 +347,6 @@ class AudioManager:
             return
 
         def callback(outdata: Any, frames: int, _time_info: Any, status: Any) -> None:
-            if status:
-                pass
             needed = frames * 2
             while len(self._speaker_buffer) < needed:
                 try:
@@ -350,7 +368,7 @@ class AudioManager:
                 channels=1,
                 dtype="int16",
                 blocksize=self.blocksize,
-                latency="low",
+                latency="high" if platform.system() == "Linux" else "low",
                 callback=callback,
             )
             self._output_stream.start()
@@ -365,8 +383,6 @@ class AudioManager:
             return
 
         def callback(indata: Any, frames: int, _time_info: Any, status: Any) -> None:
-            if status:
-                pass
             data = bytes(indata)
             rms = pcm16_rms(data)
             now = time.monotonic()
@@ -388,7 +404,7 @@ class AudioManager:
                 channels=1,
                 dtype="int16",
                 blocksize=self.blocksize,
-                latency="low",
+                latency="high" if platform.system() == "Linux" else "low",
                 callback=callback,
             )
             self._input_stream.start()
@@ -408,15 +424,14 @@ class AudioManager:
                 return
             self._client_speaking_until = now + VOICE_HOLD_SECONDS
         
-        # Non-blocking clear of stale audio packets to eliminate buffer delay
-        while self._speaker_q.qsize() > 2:
+        while self._speaker_q.qsize() > 4:
             with suppress(queue.Empty):
                 self._speaker_q.get_nowait()
         with suppress(queue.Full):
             self._speaker_q.put_nowait(data)
 
     def add_host_listener(self) -> asyncio.Queue[bytes]:
-        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
         with self._lock:
             self._host_listeners.add(q)
         return q
@@ -1064,7 +1079,7 @@ HTML = r"""<!doctype html>
       micWs.binaryType = "arraybuffer";
       await new Promise(resolve => micWs.onopen = resolve);
       micSource = ctx.createMediaStreamSource(micStream);
-      micNode = ctx.createScriptProcessor(512, 1, 1);
+      micNode = ctx.createScriptProcessor(1024, 1, 1);
       micNode.onaudioprocess = (event) => {
         if (!micWs || micWs.readyState !== WebSocket.OPEN) return;
         if (performance.now() < remoteSpeakingUntil) return;
