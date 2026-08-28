@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ctypes
 import json
 import logging
 import math
@@ -16,15 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, List, Optional, Set
-
-# Suppress low-level ALSA / C-library error spew on Linux systems
-if platform.system() == "Linux":
-    try:
-        asound = ctypes.cdll.LoadLibrary("libasound.so.2")
-        asound.snd_lib_error_set_handler(None)
-    except Exception:
-        pass
+from typing import Any, Dict, Optional, Set
 
 try:
     import cv2  # type: ignore
@@ -51,19 +42,13 @@ except Exception as exc:
 
 HOST = os.environ.get("RC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RC_PORT", "8000"))
-
-# Supports both integer indices (1) and explicit V4L2 device paths ("/dev/video1")
-_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "auto")
-VIDEO_DEVICE: Any = int(_raw_dev) if _raw_dev.isdigit() else _raw_dev
-
-# Defaults tuned for crisp high-definition streaming
-VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "1280"))
-VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "720"))
-VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
-JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "85"))
+VIDEO_DEVICE = int(os.environ.get("RC_VIDEO_DEVICE", "1"))
+VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "640"))
+VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "480"))
+VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "24"))
+JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "70"))
 AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
-
-AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "1024"))
+AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "512"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
 VOICE_RMS_THRESHOLD = float(os.environ.get("RC_VOICE_RMS", "0.018"))
 VOICE_HOLD_SECONDS = float(os.environ.get("RC_VOICE_HOLD", "0.38"))
@@ -89,7 +74,7 @@ def quiet_stream_disconnect_logs() -> None:
 TINY_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
     "2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/"
-    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/"
+    "xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/"
     "9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Ap//xAAUEAEAAAAAAAAA"
     "AAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EABQRAQAAAAAAAAAAAAAAAAAAABD/"
     "2gAIAQIBAT8QH//EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z"
@@ -104,24 +89,8 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def detect_available_cameras(max_probe: int = 8) -> List[Any]:
-    """Scans hardware indices to detect available cameras."""
-    if cv2 is None:
-        return []
-    found: List[Any] = []
-    backend = cv2.CAP_V4L2 if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
-    for idx in range(max_probe):
-        cap = cv2.VideoCapture(idx, backend)
-        if cap and cap.isOpened():
-            ok, _ = cap.read()
-            if ok:
-                found.append(idx)
-            cap.release()
-    return found
-
-
 class ThreadedCamera:
-    def __init__(self, device: Any, width: int, height: int, fps: float, quality: int) -> None:
+    def __init__(self, device: int, width: int, height: int, fps: float, quality: int) -> None:
         self.device = device
         self.width = width
         self.height = height
@@ -139,6 +108,8 @@ class ThreadedCamera:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        # On macOS, AVFoundation camera permission checks must happen on the
+        # main run loop. Opening before the worker starts avoids a noisy failure.
         self._open()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="camera", daemon=True)
@@ -149,55 +120,22 @@ class ThreadedCamera:
         if cv2 is None:
             print("cv2 is not installed; using static fallback video frame.")
             return
-
-        target_device = self.device
-
-        # If device is set to "auto" or failed initialization, scan available devices
-        if target_device == "auto":
-            available = detect_available_cameras()
-            if available:
-                target_device = available[0]
-                print(f"Detected cameras at indices {available}. Auto-selected index {target_device}.")
-            else:
-                target_device = 0
-
-        backend = cv2.CAP_V4L2 if platform.system() == "Linux" and hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
-        self._cap = cv2.VideoCapture(target_device, backend)
-
-        if not self._cap or not self._cap.isOpened():
-            # Attempt to probe alternative connected cameras if initial choice fails
-            available = detect_available_cameras()
-            if available and available[0] != target_device:
-                target_device = available[0]
-                print(f"Falling back to discovered camera index {target_device}.")
-                self._cap = cv2.VideoCapture(target_device, backend)
-
+        self._cap = cv2.VideoCapture(self.device)
         if not self._cap or not self._cap.isOpened():
             self._camera_ok = False
             if self._cap:
                 with suppress(Exception):
                     self._cap.release()
                 self._cap = None
-            print(f"No usable camera detected at index/device {self.device}; using generated dummy video.")
+            print(f"No camera detected at index {self.device}; using generated dummy video.")
             return
-
         self._camera_ok = True
-        self.device = target_device
-
-        # Configure High Quality Stream & MJPEG Codec hardware acceleration
-        with suppress(Exception):
-            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)
-        
-        # Crisp camera controls (sharpness/auto-exposure focus)
         with suppress(Exception):
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera opened at device {self.device} ({actual_w}x{actual_h} @ {self.fps}FPS).")
+        print(f"Camera opened at index {self.device}.")
 
     def _dummy_frame(self) -> Optional[bytes]:
         if cv2 is None or np is None:
@@ -237,19 +175,7 @@ class ThreadedCamera:
             if self._camera_ok and self._cap:
                 ok, frame = self._cap.read()
                 if ok and frame is not None and cv2 is not None:
-                    # Optional crisp resizing if hardware captured a different size
-                    h, w = frame.shape[:2]
-                    if w != self.width or h != self.height:
-                        frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-                    
-                    ok, encoded = cv2.imencode(
-                        ".jpg",
-                        frame,
-                        [
-                            int(cv2.IMWRITE_JPEG_QUALITY), self.quality,
-                            int(cv2.IMWRITE_JPEG_OPTIMIZE), 1
-                        ],
-                    )
+                    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
                     if ok:
                         jpeg = encoded.tobytes()
                 else:
@@ -324,11 +250,6 @@ class MotorDriver:
             if motor is not None:
                 with suppress(Exception):
                     motor.stop()
-
-    def close(self) -> None:
-        self.stop()
-        for motor in (self._drive_motor, self._steer_motor):
-            if motor is not None:
                 with suppress(Exception):
                     motor.close()
 
@@ -400,6 +321,8 @@ class AudioManager:
             return
 
         def callback(outdata: Any, frames: int, _time_info: Any, status: Any) -> None:
+            if status:
+                pass
             needed = frames * 2
             while len(self._speaker_buffer) < needed:
                 try:
@@ -421,7 +344,7 @@ class AudioManager:
                 channels=1,
                 dtype="int16",
                 blocksize=self.blocksize,
-                latency="high" if platform.system() == "Linux" else "low",
+                latency="low",
                 callback=callback,
             )
             self._output_stream.start()
@@ -436,6 +359,8 @@ class AudioManager:
             return
 
         def callback(indata: Any, frames: int, _time_info: Any, status: Any) -> None:
+            if status:
+                pass
             data = bytes(indata)
             rms = pcm16_rms(data)
             now = time.monotonic()
@@ -457,7 +382,7 @@ class AudioManager:
                 channels=1,
                 dtype="int16",
                 blocksize=self.blocksize,
-                latency="high" if platform.system() == "Linux" else "low",
+                latency="low",
                 callback=callback,
             )
             self._input_stream.start()
@@ -476,15 +401,14 @@ class AudioManager:
             if now < self._host_speaking_until:
                 return
             self._client_speaking_until = now + VOICE_HOLD_SECONDS
-
-        while self._speaker_q.qsize() > 4:
+        while self._speaker_q.full():
             with suppress(queue.Empty):
                 self._speaker_q.get_nowait()
         with suppress(queue.Full):
             self._speaker_q.put_nowait(data)
 
     def add_host_listener(self) -> asyncio.Queue[bytes]:
-        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
         with self._lock:
             self._host_listeners.add(q)
         return q
@@ -592,7 +516,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         print("Shutting down hardware streams.")
-        motors.close()
+        motors.stop()
         audio.stop()
         camera.stop()
 
@@ -650,8 +574,7 @@ HTML = r"""<!doctype html>
       width: 100%;
       height: 100%;
       object-fit: contain;
-      image-rendering: -webkit-optimize-contrast;
-      image-rendering: crisp-edges;
+      image-rendering: auto;
     }
     .topbar {
       position: absolute;
@@ -841,7 +764,7 @@ HTML = r"""<!doctype html>
       <img class="video" src="/video_feed" alt="Live video">
       <div class="topbar">
         <div class="badge"><span id="controlDot" class="dot"></span><span id="controlStatus">control offline</span></div>
-        <div class="badge"><span id="fps">HD stream</span></div>
+        <div class="badge"><span id="fps">video stream</span></div>
       </div>
     </section>
     <aside>
@@ -938,7 +861,7 @@ HTML = r"""<!doctype html>
 
     async function authedWsUrl(path) {
       if (!currentUser) throw new Error("Please sign in first.");
-      const token = await currentUser.getIdToken(true);
+      const token = await currentUser.getIdToken();
       return `${wsUrl(path)}?token=${encodeURIComponent(token)}`;
     }
 
@@ -1001,7 +924,7 @@ HTML = r"""<!doctype html>
       }
     }
 
-    setInterval(sendControl, 60);
+    setInterval(sendControl, 45);
 
     addEventListener("keydown", (e) => {
       if (!currentUser) return;
@@ -1133,7 +1056,7 @@ HTML = r"""<!doctype html>
       micWs.binaryType = "arraybuffer";
       await new Promise(resolve => micWs.onopen = resolve);
       micSource = ctx.createMediaStreamSource(micStream);
-      micNode = ctx.createScriptProcessor(1024, 1, 1);
+      micNode = ctx.createScriptProcessor(512, 1, 1);
       micNode.onaudioprocess = (event) => {
         if (!micWs || micWs.readyState !== WebSocket.OPEN) return;
         if (performance.now() < remoteSpeakingUntil) return;
@@ -1267,22 +1190,19 @@ async def status() -> Dict[str, Any]:
 async def mjpeg_generator():
     boundary = b"--frame"
     delay = 1.0 / max(VIDEO_FPS, 1)
-    last_frame = None
     try:
         while True:
             frame = camera.frame()
-            if frame is not last_frame:
-                last_frame = frame
-                yield (
-                    boundary
-                    + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store, no-cache, must-revalidate\r\nContent-Length: "
-                    + str(len(frame)).encode()
-                    + b"\r\n\r\n"
-                    + frame
-                    + b"\r\n"
-                )
+            yield (
+                boundary
+                + b"\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\nContent-Length: "
+                + str(len(frame)).encode()
+                + b"\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
             await asyncio.sleep(delay)
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError:
         return
 
 
@@ -1291,11 +1211,7 @@ async def video_feed() -> StreamingResponse:
     return StreamingResponse(
         mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Connection": "close",
-        },
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
 
 
@@ -1333,8 +1249,8 @@ async def ws_control(ws: WebSocket) -> None:
 async def control_watchdog(ws: WebSocket, last_msg_getter: Any) -> None:
     try:
         while True:
-            await asyncio.sleep(0.1)
-            if time.monotonic() - last_msg_getter() > 0.65:
+            await asyncio.sleep(0.2)
+            if time.monotonic() - last_msg_getter() > 0.35:
                 motors.stop()
     except asyncio.CancelledError:
         return
