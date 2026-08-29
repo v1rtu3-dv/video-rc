@@ -421,6 +421,7 @@ class AudioManager:
                 channels=1,
                 dtype="int16",
                 blocksize=self.blocksize,
+                device=10,  # Add your specific Bluetooth output device index here
                 latency="high" if platform.system() == "Linux" else "low",
                 callback=callback,
             )
