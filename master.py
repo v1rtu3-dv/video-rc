@@ -61,7 +61,7 @@ VIDEO_WIDTH = int(os.environ.get("RC_VIDEO_WIDTH", "1280"))
 VIDEO_HEIGHT = int(os.environ.get("RC_VIDEO_HEIGHT", "720"))
 VIDEO_FPS = float(os.environ.get("RC_VIDEO_FPS", "30"))
 JPEG_QUALITY = int(os.environ.get("RC_JPEG_QUALITY", "85"))
-AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "48000"))
+AUDIO_RATE = int(os.environ.get("RC_AUDIO_RATE", "44100"))
 
 AUDIO_BLOCK = int(os.environ.get("RC_AUDIO_BLOCK", "1024"))
 VERBOSE = os.environ.get("RC_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
