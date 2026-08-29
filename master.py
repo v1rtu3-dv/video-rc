@@ -53,7 +53,7 @@ HOST = os.environ.get("RC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RC_PORT", "8000"))
 
 # Supports both integer indices (1) and explicit V4L2 device paths ("/dev/video1")
-_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "auto")
+_raw_dev = os.environ.get("RC_VIDEO_DEVICE", "/dev/video0")
 VIDEO_DEVICE: Any = int(_raw_dev) if _raw_dev.isdigit() else _raw_dev
 
 # Defaults tuned for crisp high-definition streaming
